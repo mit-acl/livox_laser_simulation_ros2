@@ -120,7 +120,12 @@ namespace gazebo
       double minDist = 0.1;
 
       int64_t accumulateScans = 5;
-      std::deque<std::vector<std::pair<ignition::math::Vector3d, float>>> pointHistory;
+      struct Scan
+      {
+         common::Time time;  // sim time the scan was cast at
+         std::vector<std::pair<ignition::math::Vector3d, float>> points;
+      };
+      std::deque<Scan> pointHistory;
 
       std::string ns_ = "default_frame";
    };
