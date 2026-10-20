@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <gazebo_ros/conversions/builtin_interfaces.hpp>
 #include <gazebo_ros/node.hpp>
 #include <rclcpp/logging.hpp>
 
@@ -168,8 +169,14 @@ namespace gazebo
             InitializeRays(points_pair, rayShape);
             rayShape->Update();
 
+            // The sim time this scan was cast at; it stamps every message below.
+            // Not the node clock: the plugin node is forced onto use_sim_time and
+            // /clock is published at 10 Hz by default, so now() lags by up to 0.1 s
+            // and repeats across scans.
+            const common::Time scanTime = world->SimTime();
+
             // Create laser scan message and set the timestamp
-            msgs::Set(laserMsg.mutable_time(), world->SimTime());
+            msgs::Set(laserMsg.mutable_time(), scanTime);
             msgs::LaserScan *scan = laserMsg.mutable_scan();
             InitializeScan(scan);
 
@@ -198,49 +205,54 @@ namespace gazebo
             }
 
             // Push current scan and evict oldest if buffer is full
-            pointHistory.push_back(std::move(currentScanPoints));
+            pointHistory.push_back({scanTime, std::move(currentScanPoints)});
             while (static_cast<int64_t>(pointHistory.size()) > accumulateScans)
             {
                 pointHistory.pop_front();
             }
 
-            // Build messages from ALL accumulated scans
-            auto now = node_->get_clock()->now();
+            // Build messages from ALL accumulated scans. As the Livox driver does,
+            // the header stamp and timebase are the time of the oldest point and
+            // offset_time is each point's time after it: Gazebo casts a whole scan
+            // at one instant, so offsets step per accumulated scan and are all 0
+            // with accumulate_scans 1.
+            const common::Time baseTime = pointHistory.front().time;
             std::string frame_id = ns_ + "/" + raySensor->Name();
 
             livox_ros_driver2::msg::CustomMsg pp_livox;
-            pp_livox.header.stamp = now;
+            pp_livox.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(baseTime);
             pp_livox.header.frame_id = frame_id;
+            pp_livox.timebase = rclcpp::Time(pp_livox.header.stamp).nanoseconds();
 
             sensor_msgs::msg::PointCloud cloud;
-            cloud.header.stamp = now;
-            cloud.header.frame_id = frame_id;
+            cloud.header = pp_livox.header;
+            cloud.channels.resize(1);
+            cloud.channels[0].name = "intensity";
 
             // Reserve total capacity across all accumulated scans
             size_t totalPoints = 0;
-            for (auto &scanPoints : pointHistory)
+            for (auto &scan : pointHistory)
             {
-                totalPoints += scanPoints.size();
+                totalPoints += scan.points.size();
             }
             pp_livox.points.reserve(totalPoints);
             cloud.points.reserve(totalPoints);
+            cloud.channels[0].values.reserve(totalPoints);
 
-            boost::chrono::high_resolution_clock::time_point start_time = boost::chrono::high_resolution_clock::now();
             int count = 0;
 
-            for (auto &scanPoints : pointHistory)
+            for (auto &scan : pointHistory)
             {
-                for (auto &[point, intensity] : scanPoints)
+                const common::Time offset = scan.time - baseTime;
+                const uint32_t offset_ns = static_cast<uint32_t>(offset.sec * 1000000000LL + offset.nsec);
+                for (auto &[point, intensity] : scan.points)
                 {
                     livox_ros_driver2::msg::CustomPoint p;
                     p.x = point.X();
                     p.y = point.Y();
                     p.z = point.Z();
                     p.reflectivity = intensity;
-
-                    boost::chrono::high_resolution_clock::time_point end_time = boost::chrono::high_resolution_clock::now();
-                    boost::chrono::nanoseconds elapsed_time = boost::chrono::duration_cast<boost::chrono::nanoseconds>(end_time - start_time);
-                    p.offset_time = elapsed_time.count();
+                    p.offset_time = offset_ns;
 
                     pp_livox.points.push_back(p);
 
@@ -248,6 +260,7 @@ namespace gazebo
                     cloud.points.back().x = point.X();
                     cloud.points.back().y = point.Y();
                     cloud.points.back().z = point.Z();
+                    cloud.channels[0].values.push_back(intensity);
 
                     count++;
                 }
@@ -259,12 +272,9 @@ namespace gazebo
             pp_livox.point_num = count;
             custom_pub->publish(pp_livox);
 
-            // Publish PointCloud2 type message
+            // Publish PointCloud2 type message (x, y, z, intensity), same stamp
             sensor_msgs::msg::PointCloud2 cloud2;
             sensor_msgs::convertPointCloudToPointCloud2(cloud, cloud2);
-            cloud2.header = cloud.header;
-            // Get wall time (ROS2 time) and publish the PointCloud2 message
-            cloud2.header.stamp = rclcpp::Clock().now();
             cloud2_pub->publish(cloud2);
         }
     }
